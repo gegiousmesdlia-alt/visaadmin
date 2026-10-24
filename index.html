@@ -531,6 +531,21 @@ window.openModal = function(ref){
         <textarea id="decisionReasonInput" rows="4" style="width:100%;padding:10px 12px;border:1.5px solid var(--border);border-radius:var(--radius);font-size:13px;font-family:inherit;resize:vertical" placeholder="e.g. Your visa has been approved. Please ensure your travel documents are in order before collection...">${a.decisionReason||''}</textarea>
       </div>
       <div class="field" style="margin-bottom:14px">
+        <label style="display:block;font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:8px">Decision Letter Languages Available to Applicant</label>
+        <div style="display:flex;gap:14px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+            <input type="checkbox" id="lang-en" value="en" ${(a.decisionLetterLangs||['en']).includes('en')?'checked':''} style="width:16px;height:16px;accent-color:var(--blue)"/> 🇺🇸 English
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+            <input type="checkbox" id="lang-pt" value="pt" ${(a.decisionLetterLangs||[]).includes('pt')?'checked':''} style="width:16px;height:16px;accent-color:var(--blue)"/> 🇧🇷 Português
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+            <input type="checkbox" id="lang-es" value="es" ${(a.decisionLetterLangs||[]).includes('es')?'checked':''} style="width:16px;height:16px;accent-color:var(--blue)"/> 🇪🇸 Español
+          </label>
+        </div>
+        <p style="font-size:11px;color:var(--muted);margin-top:6px">Applicant will see a language selector when multiple languages are ticked.</p>
+      </div>
+      <div class="field" style="margin-bottom:14px">
         <label style="display:block;font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Delivery Address (for approved applications)</label>
         <textarea id="deliveryAddressInput" rows="2" style="width:100%;padding:10px 12px;border:1.5px solid var(--border);border-radius:var(--radius);font-size:13px;font-family:inherit" placeholder="Full address where the visa/passport should be delivered">${a.deliveryAddress||''}</textarea>
       </div>
@@ -551,7 +566,34 @@ window.closeModal = function(){ document.getElementById('modalOverlay').classLis
 window.downloadDecisionAdmin = function(){
   const a = allApps.find(x=>x.ref===currentDetailRef);
   if(!a) return;
-  generateDecisionLetterPDF(a);
+  // Admin always sees all 3 language options
+  openAdminLangPicker(a);
+};
+
+function openAdminLangPicker(a){
+  const existing = document.getElementById('adminLangPickerOverlay');
+  if(existing) existing.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'adminLangPickerOverlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:999;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:16px;padding:28px 24px;max-width:360px;width:100%">
+      <h3 style="font-family:var(--serif);font-size:18px;color:var(--blue);margin-bottom:6px">Decision Letter Language</h3>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:20px">Choose which language to download:</p>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        ${[{c:'en',l:'English',f:'🇺🇸'},{c:'pt',l:'Português',f:'🇧🇷'},{c:'es',l:'Español',f:'🇪🇸'}].map(opt=>`
+          <button onclick="generateDecisionLetterPDF(window._adminLangPickerApp,'${opt.c}');document.getElementById('adminLangPickerOverlay').remove()"
+            style="padding:13px 16px;border:1.5px solid var(--border);border-radius:10px;background:#fff;font-size:14px;font-weight:600;color:var(--text);cursor:pointer;display:flex;align-items:center;gap:10px;text-align:left">
+            <span style="font-size:20px">${opt.f}</span>${opt.l}
+          </button>
+        `).join('')}
+      </div>
+      <button onclick="document.getElementById('adminLangPickerOverlay').remove()" style="width:100%;margin-top:14px;background:none;border:none;color:var(--muted);font-size:13px;cursor:pointer;padding:8px">Cancel</button>
+    </div>
+  `;
+  overlay.addEventListener('click', e=>{ if(e.target===overlay) overlay.remove(); });
+  window._adminLangPickerApp = a;
+  document.body.appendChild(overlay);
 };
 
 window.downloadVisaAdmin = async function(){
@@ -695,7 +737,10 @@ window.confirmDecision = async function(decision){
   const address = (document.getElementById('deliveryAddressInput')?.value||'').trim();
   if(!reason){ alert('Please write a reason / note for the applicant before setting this decision.'); return; }
   if(decision==='approved' && !address){ alert('Please enter a delivery address before approving.'); return; }
-  await updateStatus(decision, address, reason);
+  // Collect selected languages
+  const langs = ['en','pt','es'].filter(l=>document.getElementById('lang-'+l)?.checked);
+  if(langs.length===0){ alert('Please select at least one language for the decision letter.'); return; }
+  await updateStatus(decision, address, reason, langs);
 };
 
 const DEFAULT_FEES = {B1B2:185,F1:185,H1B:190,J1:160,O1:460,L1:460};
@@ -907,14 +952,14 @@ window.saveLayout = async function(){
   }
 };
 
-window.updateStatus = async function(newReviewStatus, deliveryAddress, decisionReason){
+window.updateStatus = async function(newReviewStatus, deliveryAddress, decisionReason, langs){
   const msg = document.getElementById('updateMsg');
   msg.style.display='block'; msg.style.color='var(--muted)'; msg.textContent='Updating...';
   try{
     const payload = { reviewStatus:newReviewStatus, updatedAt:serverTimestamp() };
     if(deliveryAddress) payload.deliveryAddress = deliveryAddress;
     if(decisionReason) payload.decisionReason = decisionReason;
-    // Auto-set feePaid when approving if admin has confirmed payment
+    if(langs && langs.length) payload.decisionLetterLangs = langs;
     if(newReviewStatus==='approved') payload.feePaid = true;
     await updateDoc(doc(db,'visa_applications',currentDetailRef), payload);
     const idx = allApps.findIndex(x=>x.ref===currentDetailRef);
