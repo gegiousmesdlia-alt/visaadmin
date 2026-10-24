@@ -113,6 +113,11 @@ body{font-family:var(--sans);color:var(--text);background:var(--offwhite);min-he
 .layout-el.photo-el{display:flex;align-items:center;justify-content:center;font-size:7px;font-weight:700;color:#002868;background:rgba(0,40,104,.08);border:1.5px dashed #002868}
 .layout-controls{display:flex;gap:8px;justify-content:center;margin-top:14px}
 .layout-hint{font-size:11.5px;color:var(--muted);text-align:center;margin-top:10px;line-height:1.5}
+.layout-preview{background-size:100% 100%;background-repeat:no-repeat;background-position:center}
+.layout-preview.has-bg .header-strip,.layout-preview.has-bg .title-hint,.layout-preview.has-bg .page-border{display:none}
+.layout-el:not(.photo-el){padding:1px 2px;line-height:1}
+.layout-el:not(.photo-el):not(.selected){background:rgba(255,255,255,.35)}
+.bg-row{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:6px}
 .field-palette{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
 .field-chip{background:#f0f2f8;border:1px solid var(--border);border-radius:20px;padding:6px 12px;font-size:11.5px;font-weight:600;color:var(--blue);cursor:pointer}
 .field-chip:active{background:#dde3f0}
@@ -239,6 +244,12 @@ body{font-family:var(--sans);color:var(--text);background:var(--offwhite);min-he
       <button class="close-btn" onclick="closeLayoutEditor()">✕</button>
     </div>
     <div class="modal-body">
+      <div class="bg-row">
+        <input type="file" id="bgFile" accept="image/png,image/jpeg" style="display:none" onchange="uploadBackground(this)">
+        <button class="action-btn" onclick="document.getElementById('bgFile').click()">🖼 Upload Background</button>
+        <button class="action-btn" id="removeBgBtn" onclick="removeBackground()" disabled>Remove Background</button>
+      </div>
+      <p class="update-msg" id="bgMsg" style="text-align:center"></p>
       <div class="layout-preview-wrap">
         <div class="layout-preview" id="layoutPreview">
           <div class="header-strip"></div>
@@ -247,12 +258,14 @@ body{font-family:var(--sans);color:var(--text);background:var(--offwhite);min-he
           <!-- Draggable elements injected here by JS -->
         </div>
       </div>
-      <p class="layout-hint">Tap an element on the canvas to select it, then use Delete Selected to remove it. The watermark and disclaimers always render on top and aren't editable here.</p>
+      <p class="layout-hint">Tap an element on the canvas to select it, drag it onto the right spot (arrow keys nudge it, A−/A+ change its size), or use Delete Selected to remove it. The preview matches where the text lands in the PDF.</p>
 
       <div class="field-palette" id="fieldPalette"></div>
 
       <div class="layout-controls" style="flex-wrap:wrap">
         <button class="action-btn" id="customTextBtn" onclick="addCustomTextElement()">+ Custom Text</button>
+        <button class="action-btn" id="sizeDownBtn" onclick="resizeSelected(-1)" disabled>A−</button>
+        <button class="action-btn" id="sizeUpBtn" onclick="resizeSelected(1)" disabled>A+</button>
         <button class="action-btn" id="deleteSelBtn" onclick="deleteSelectedElement()" disabled>Delete Selected</button>
         <button class="action-btn" onclick="resetLayout()">Reset to Default</button>
         <button class="action-btn approve" onclick="saveLayout()">Save Layout</button>
@@ -607,7 +620,8 @@ window.downloadVisaAdmin = async function(){
       const layoutSnap = await getDoc(doc(db,'settings','visaLayout'));
       if(layoutSnap.exists() && Array.isArray(layoutSnap.data().elements)) elements = layoutSnap.data().elements;
     } catch(e){ /* use built-in defaults */ }
-    await generateVisaPDF(a, elements);
+    const backgroundUrl = await fetchVisaBackground();
+    await generateVisaPDF(a, elements, backgroundUrl ? { backgroundUrl } : {});
   } catch(e){
     alert('Could not generate the document. Please try again.');
   }
@@ -816,14 +830,38 @@ function buildFieldPalette(){
   ).join('') + `<div class="field-chip" onclick="addPhotoElement()">+ Photo</div>`;
 }
 
+// Sample values so the preview text has the same width as the real PDF text
+const PREVIEW_SAMPLE = {
+  fullName:'Jane Q. Sample', firstName:'Jane', lastName:'Sample', middleName:'Q.',
+  passportNum:'X1234567', citizenship:'Sampleland', dob:'01/01/1990', visaType:'Category A',
+  ref:'REF-000123', entries:'Multiple', deliveryAddress:'1 Example Street'
+};
+// In the PDF, y is the text BASELINE and x the left edge of the glyphs. The preview box
+// has a border+padding, so we offset it to make what you see match what is printed.
+const PAD_X = 3, PAD_Y = 2;
+function textOffsets(el){
+  return { x: PAD_X, y: PAD_Y + 0.85 * (el.fontSize||10) * SCALE };
+}
+
+let currentBackground = null;
+
+function applyPreviewBackground(){
+  const preview = document.getElementById('layoutPreview');
+  preview.style.backgroundImage = currentBackground ? `url(${currentBackground})` : 'none';
+  preview.classList.toggle('has-bg', !!currentBackground);
+  document.getElementById('removeBgBtn').disabled = !currentBackground;
+}
+
 function renderLayoutPreview(){
   const preview = document.getElementById('layoutPreview');
   // Remove previously rendered elements (keep the static guide divs)
   preview.querySelectorAll('.layout-el').forEach(el=>el.remove());
+  applyPreviewBackground();
 
   currentElements.forEach(el=>{
     const div = document.createElement('div');
     div.dataset.id = el.id;
+    let offX = 0, offY = 0;
     if(el.type === 'photo'){
       div.className = 'layout-el photo-el' + (el.id===selectedElId ? ' selected' : '');
       div.style.width = ptToPx(el.w)+'px';
@@ -832,14 +870,22 @@ function renderLayoutPreview(){
     } else {
       div.className = 'layout-el' + (el.id===selectedElId ? ' selected' : '');
       const def = el.type==='field' ? window.VISA_FIELD_DEFS.find(f=>f.key===el.fieldKey) : null;
-      div.textContent = el.type==='field' ? (def ? def.label : el.fieldKey) : (el.content || '(empty text)');
+      if(el.type==='field'){
+        const val = (typeof getFieldValue==='function') ? getFieldValue(PREVIEW_SAMPLE, el.fieldKey) : '';
+        div.textContent = (def ? def.label : el.fieldKey) + ': ' + val;
+      } else {
+        div.textContent = el.content || '(empty text)';
+      }
+      div.style.fontSize = ptToPx(el.fontSize || 10)+'px';
+      div.style.fontFamily = el.mono ? 'Courier, monospace' : 'Helvetica, Arial, sans-serif';
+      const o = textOffsets(el); offX = o.x; offY = o.y;
     }
-    div.style.left = ptToPx(el.x)+'px';
-    div.style.top = ptToPx(el.y)+'px';
+    div.style.left = (ptToPx(el.x) - offX)+'px';
+    div.style.top = (ptToPx(el.y) - offY)+'px';
     div.addEventListener('pointerdown', e=>{ selectElement(el.id); });
     makeDraggable(div, (left, top)=>{
-      el.x = Math.round(pxToPt(left));
-      el.y = Math.round(pxToPt(top));
+      el.x = Math.round(pxToPt(left + offX));
+      el.y = Math.round(pxToPt(top + offY));
     });
     document.getElementById('layoutPreview').appendChild(div);
   });
@@ -854,7 +900,18 @@ function renderLayoutPreview(){
 function selectElement(id){
   selectedElId = id;
   document.getElementById('deleteSelBtn').disabled = false;
-  renderLayoutPreview();
+  document.getElementById('sizeDownBtn').disabled = false;
+  document.getElementById('sizeUpBtn').disabled = false;
+  // Re-rendering on every pointerdown destroyed the element being grabbed, so dragging never
+  // started. Only re-render when the element isn't on the canvas yet (newly added).
+  const preview = document.getElementById('layoutPreview');
+  const nodes = preview.querySelectorAll('.layout-el');
+  const exists = Array.from(nodes).some(d=>d.dataset.id===id);
+  if(exists){
+    nodes.forEach(d=>d.classList.toggle('selected', d.dataset.id===id));
+  } else {
+    renderLayoutPreview();
+  }
 }
 
 function makeDraggable(el, onMove){
@@ -911,6 +968,8 @@ window.deleteSelectedElement = function(){
   currentElements = currentElements.filter(e=>e.id!==selectedElId);
   selectedElId = null;
   document.getElementById('deleteSelBtn').disabled = true;
+  document.getElementById('sizeDownBtn').disabled = true;
+  document.getElementById('sizeUpBtn').disabled = true;
   renderLayoutPreview();
 };
 
@@ -920,6 +979,9 @@ window.openLayoutEditor = async function(){
   currentElements = JSON.parse(JSON.stringify(window.DEFAULT_VISA_ELEMENTS));
   selectedElId = null;
   document.getElementById('deleteSelBtn').disabled = true;
+  document.getElementById('sizeDownBtn').disabled = true;
+  document.getElementById('sizeUpBtn').disabled = true;
+  currentBackground = await fetchVisaBackground();
   try{
     const snap = await getDoc(doc(db,'settings','visaLayout'));
     if(snap.exists()){
@@ -937,6 +999,8 @@ window.resetLayout = function(){
   currentElements = JSON.parse(JSON.stringify(window.DEFAULT_VISA_ELEMENTS));
   selectedElId = null;
   document.getElementById('deleteSelBtn').disabled = true;
+  document.getElementById('sizeDownBtn').disabled = true;
+  document.getElementById('sizeUpBtn').disabled = true;
   renderLayoutPreview();
 };
 
@@ -951,6 +1015,98 @@ window.saveLayout = async function(){
     msg.style.color='var(--red)'; msg.textContent='Failed to save layout. Please try again.';
   }
 };
+
+// ----- Background template (stored in Firestore so every page/PDF can use it) -----
+async function fetchVisaBackground(){
+  try{
+    const snap = await getDoc(doc(db,'settings','visaBackground'));
+    if(snap.exists() && snap.data().dataUrl) return snap.data().dataUrl;
+  } catch(e){ /* no background */ }
+  return null;
+}
+
+// Shrinks the image to fit a Firestore document (1 MB limit) at 2x page resolution
+function compressBackground(file){
+  return new Promise((resolve, reject)=>{
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = ()=>{
+      const maxW = 1224, maxH = 1584;
+      const ratio = Math.min(1, maxW/img.width, maxH/img.height);
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width*ratio); c.height = Math.round(img.height*ratio);
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#fff'; ctx.fillRect(0,0,c.width,c.height);
+      ctx.drawImage(img,0,0,c.width,c.height);
+      URL.revokeObjectURL(url);
+      let q = 0.85, out = c.toDataURL('image/jpeg', q);
+      while(out.length > 900000 && q > 0.3){ q -= 0.1; out = c.toDataURL('image/jpeg', q); }
+      out.length > 900000 ? reject(new Error('Image is too large even after compression.')) : resolve(out);
+    };
+    img.onerror = ()=>{ URL.revokeObjectURL(url); reject(new Error('Could not read that image.')); };
+    img.src = url;
+  });
+}
+
+window.uploadBackground = async function(input){
+  const file = input.files && input.files[0];
+  input.value = '';
+  if(!file) return;
+  const msg = document.getElementById('bgMsg');
+  msg.style.display='block'; msg.style.color='var(--muted)'; msg.textContent='Uploading background...';
+  try{
+    const dataUrl = await compressBackground(file);
+    await setDoc(doc(db,'settings','visaBackground'), { dataUrl, updatedAt:serverTimestamp() });
+    currentBackground = dataUrl;
+    renderLayoutPreview();
+    msg.style.color='var(--green)'; msg.textContent='✅ Background saved. Drag the fields into place, then Save Layout.';
+  } catch(e){
+    msg.style.color='var(--red)'; msg.textContent = e.message || 'Failed to save background.';
+  }
+};
+
+window.removeBackground = async function(){
+  const msg = document.getElementById('bgMsg');
+  msg.style.display='block'; msg.style.color='var(--muted)'; msg.textContent='Removing...';
+  try{
+    await setDoc(doc(db,'settings','visaBackground'), { dataUrl:null, updatedAt:serverTimestamp() });
+    currentBackground = null;
+    renderLayoutPreview();
+    msg.style.color='var(--green)'; msg.textContent='Background removed.';
+  } catch(e){
+    msg.style.color='var(--red)'; msg.textContent='Failed to remove background.';
+  }
+};
+
+// A− / A+ : font size for text, box size for the photo
+window.resizeSelected = function(dir){
+  const el = currentElements.find(e=>e.id===selectedElId);
+  if(!el) return;
+  if(el.type === 'photo'){
+    const f = dir>0 ? 1.1 : 1/1.1;
+    el.w = Math.max(30, Math.round(el.w*f));
+    el.h = Math.max(30, Math.round(el.h*f));
+  } else {
+    el.fontSize = Math.max(6, Math.min(48, (el.fontSize||10) + dir));
+  }
+  renderLayoutPreview();
+};
+
+// Arrow keys nudge the selected item while the editor is open (Shift = 10pt)
+document.addEventListener('keydown', e=>{
+  if(!document.getElementById('layoutOverlay').classList.contains('open')) return;
+  const tag = (e.target.tagName||'').toLowerCase();
+  if(tag==='input' || tag==='textarea') return;
+  const el = currentElements.find(x=>x.id===selectedElId);
+  if(!el) return;
+  const step = e.shiftKey ? 10 : 1;
+  const d = {ArrowLeft:[-step,0], ArrowRight:[step,0], ArrowUp:[0,-step], ArrowDown:[0,step]}[e.key];
+  if(!d) return;
+  e.preventDefault();
+  el.x = Math.max(0, Math.min(PAGE_PT.w, el.x + d[0]));
+  el.y = Math.max(0, Math.min(PAGE_PT.h, el.y + d[1]));
+  renderLayoutPreview();
+});
 
 window.updateStatus = async function(newReviewStatus, deliveryAddress, decisionReason, langs){
   const msg = document.getElementById('updateMsg');
